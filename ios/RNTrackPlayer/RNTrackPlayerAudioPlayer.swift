@@ -22,7 +22,7 @@ import MediaPlayer
 * lock screen controls.
 */
 
-public class RNTrackPlayerAudioPlayer: QueuedAudioPlayer {
+public class RNTrackPlayerAudioPlayer: QueuedAudioPlayer, QueueManagerDelegate {
 
 	public var reactEventEmitter: RCTEventEmitter
 
@@ -30,20 +30,18 @@ public class RNTrackPlayerAudioPlayer: QueuedAudioPlayer {
 	// can maintain the same rate in cases when SwiftAudio would not.
 	private var _rate: Float
 
-	// Override _currentItem so that we can send an event when it changes.
-	override var _currentItem: AudioItem? {
-		willSet(newCurrentItem) {
-			if ((newCurrentItem as? Track) === (_currentItem as? Track)) {
-				return
-			}
+	// Override rate so that we can maintain the same rate on future tracks.
+	override public var rate: Float {
+        get { return _rate }
+        set { 
+			_rate = newValue
 
-			self.reactEventEmitter.sendEvent(withName: "playback-track-changed", body: [
-				"track": (_currentItem as? Track)?.id ?? nil,
-				"position": self.currentTime,
-				"nextTrack": (newCurrentItem as? Track)?.id ?? nil,
-				])
+			// Only set the rate on the wrapper if it is already playing.
+			if wrapper.rate > 0 {
+				wrapper.rate = newValue
+			}
 		}
-	}
+    }
 
 	// Override rate so that we can maintain the same rate on future tracks.
 	override public var rate: Float {
@@ -63,6 +61,12 @@ public class RNTrackPlayerAudioPlayer: QueuedAudioPlayer {
         self._rate = 1.0
 		self.reactEventEmitter = reactEventEmitter
 		super.init()
+        self.queueManager.delegate = self
+    }
+
+    public override func stop() {
+        super.stop()
+        onTrackUpdate(previousIndex: currentIndex, nextIndex: nil)
     }
 
 	// MARK: - AVPlayerWrapperDelegate
@@ -79,6 +83,73 @@ public class RNTrackPlayerAudioPlayer: QueuedAudioPlayer {
 
 		self.reactEventEmitter.sendEvent(withName: "playback-state", body: ["state": state.rawValue])
     }
+
+    override func AVWrapper(didReceiveMetadata metadata: [AVMetadataItem]) {
+        func getMetadataItem(forIdentifier:AVMetadataIdentifier) -> String {
+            return AVMetadataItem.metadataItems(from: metadata, filteredByIdentifier: forIdentifier).first?.stringValue ?? ""
+        }
+
+        super.AVWrapper(didReceiveMetadata: metadata)
+        var source: String {
+            switch metadata.first?.keySpace {
+            case AVMetadataKeySpace.id3:
+                return "id3"
+            case AVMetadataKeySpace.icy:
+                return "icy"
+            case AVMetadataKeySpace.quickTimeMetadata:
+                return "quicktime"
+            case AVMetadataKeySpace.common:
+                return "unknown"
+            default: return "unknown"
+            }
+        }
+
+        let album = getMetadataItem(forIdentifier: .commonIdentifierAlbumName)
+        var artist = getMetadataItem(forIdentifier: .commonIdentifierArtist)
+        var title = getMetadataItem(forIdentifier: .commonIdentifierTitle)
+        var date = getMetadataItem(forIdentifier: .commonIdentifierCreationDate)
+        var url = "";
+        var genre = "";
+        if (source == "icy") {
+            url = getMetadataItem(forIdentifier: .icyMetadataStreamURL)
+        } else if (source == "id3") {
+            if (date.isEmpty) {
+                date = getMetadataItem(forIdentifier: .id3MetadataDate)
+            }
+            genre = getMetadataItem(forIdentifier: .id3MetadataContentType)
+            url = getMetadataItem(forIdentifier: .id3MetadataOfficialAudioSourceWebpage)
+            if (url.isEmpty) {
+                url = getMetadataItem(forIdentifier: .id3MetadataOfficialAudioFileWebpage)
+            }
+            if (url.isEmpty) {
+                url = getMetadataItem(forIdentifier: .id3MetadataOfficialArtistWebpage)
+            }
+        } else if (source == "quicktime") {
+            genre = getMetadataItem(forIdentifier: .quickTimeMetadataGenre)
+        }
+
+        // Detect ICY metadata and split title into artist & title:
+        // - source should be either "unknown" (pre iOS 14) or "icy" (iOS 14 and above)
+        // - we have a title, but no artist
+        if ((source == "unknown" || source == "icy") && !title.isEmpty && artist.isEmpty) {
+            if let index = title.range(of: " - ")?.lowerBound {
+                artist = String(title.prefix(upTo: index));
+                title = String(title.suffix(from: title.index(index, offsetBy: 3)));
+            }
+        }
+        var data : [String : String?] = [
+            "title": title.isEmpty ? nil : title,
+            "url": url.isEmpty ? nil : url,
+            "artist": artist.isEmpty ? nil : artist,
+            "album": album.isEmpty ? nil : album,
+            "date": date.isEmpty ? nil : date,
+            "genre": genre.isEmpty ? nil : genre
+        ]
+        if (data.values.contains { $0 != nil }) {
+            data["source"] = source
+            self.reactEventEmitter.sendEvent(withName: "playback-metadata-received", body: data)
+        }
+    }
     
     override func AVWrapper(failedWithError error: Error?) {
         super.AVWrapper(failedWithError: error)
@@ -86,20 +157,21 @@ public class RNTrackPlayerAudioPlayer: QueuedAudioPlayer {
     }
     
     override func AVWrapperItemDidPlayToEndTime() {
-        if self.nextItems.count == 0 {
-			// For consistency sake, send an event for the track changing to nothing
-			self.reactEventEmitter.sendEvent(withName: "playback-track-changed", body: [
-				"track": (self.currentItem as? Track)?.id ?? nil,
-				"position": self.currentTime,
-				"nextTrack": nil,
-				])
+        // fire an event for the queue ending
+        if nextItems.count == 0 {
+            reactEventEmitter.sendEvent(withName: "playback-queue-ended", body: [
+                "track": currentIndex,
+                "position": currentTime,
+            ])
+		}
 
-			// fire an event for the queue ending
-			self.reactEventEmitter.sendEvent(withName: "playback-queue-ended", body: [
-				"track": (self.currentItem as? Track)?.id,
-				"position": self.currentTime,
-				])
-		} 
+        // fire an event for the same track starting again
+        switch repeatMode {
+        case .track:
+            onTrackUpdate(previousIndex: currentIndex, nextIndex: currentIndex)
+        default: break
+        }
+
 		super.AVWrapperItemDidPlayToEndTime()
     }
 
@@ -125,5 +197,28 @@ public class RNTrackPlayerAudioPlayer: QueuedAudioPlayer {
 			// RNTrackPlayer.updateOptions()
 			// self.enableRemoteCommands(remoteCommands)
         }
+    }
+
+    // MARK: - Private Helpers
+
+    private func onTrackUpdate(previousIndex: Int?, nextIndex: Int?) {
+        reactEventEmitter.sendEvent(withName: "playback-track-changed", body: [
+            "track": previousIndex,
+            "position": currentTime,
+            "nextTrack": nextIndex,
+        ])
+    }
+
+    // MARK: - QueueManagerDelegate
+
+    func onCurrentIndexChanged(oldIndex: Int, newIndex: Int) {
+        // if _currentItem is nil, then this was triggered by a reset. ignore.
+        if _currentItem == nil { return }
+
+        onTrackUpdate(previousIndex: oldIndex, nextIndex: newIndex)
+    }
+
+    func onReceivedFirstItem() {
+        onTrackUpdate(previousIndex: nil, nextIndex: 0)
     }
 }

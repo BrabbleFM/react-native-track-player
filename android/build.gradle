@@ -2,7 +2,7 @@ import groovy.json.JsonSlurper
 
 buildscript {
     repositories {
-        jcenter()
+        mavenCentral()
         google()
     }
     dependencies {
@@ -52,15 +52,14 @@ repositories {
         url "../node_modules/react-native/android"
     }
 
-    jcenter()
-    google()
     mavenCentral()
+    google()
 }
 
 dependencies {
     //noinspection GradleDynamicVersion
     implementation 'com.facebook.react:react-native:+'
-
+    
     def exoPlayerVersion = safeExtGet("exoPlayerVersion", '2.11.4')
 
     // ExoPlayer Core
