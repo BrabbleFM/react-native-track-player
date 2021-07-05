@@ -58,7 +58,7 @@ public class Track extends TrackMetadata {
 
     public String contentType;
     public String userAgent;
-
+    public long initialTime;
     public Bundle originalItem;
 
     public Map<String, String> headers;
